@@ -2,41 +2,46 @@ package main
 
 import (
 	"encoding/json"
+	"io/ioutil"
+	"net/http"
 	"os"
 	"sync"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
+	"github.com/bmizerany/pat"
 	"github.com/garyburd/redigo/redis"
 	"labix.org/v2/mgo"
 )
 
 var (
 	RedisAddr    = os.Getenv("REDIS_ADDR")
-	RedisQueue   = os.Getenv("REDIS_QUEUE")
 	FrontDeskURL = os.Getenv("FRONTDESKURL")
 	MongoHost    = os.Getenv("MONGODB_HOST")
 	SlackWebHook = os.Getenv("SLACK_WEBHOOK")
 	MongoDB      = "kettle-watcher"
+	Watcher      *Watchers
 	RedisPool    *redis.Pool
 	MongoPool    *mgo.Session
 )
 
-type QueuedEvent struct {
+type Event struct {
 	UserID  string `json:userID`
 	EventID string `json:eventID`
 	Token   string `json:token`
 }
 
+type Watchers struct {
+	WatchLists map[string]*WatchList
+	sync.Mutex
+}
+
 func init() {
+
 	log.SetLevel(log.DebugLevel)
 	if len(RedisAddr) == 0 {
 		log.Info("Env REDIS_ADDR is not set. Fallback to localhost")
 		RedisAddr = "localhost"
-	}
-	if len(RedisQueue) == 0 {
-		log.Info("Env REDIS_QUEUE is not set. Fallback to watcher_queue")
-		RedisQueue = "watcher_queue"
 	}
 	if len(FrontDeskURL) == 0 {
 		log.Info("Env FRONTDESKURL is not set. Fallback to https://lutece.frontdeskhq.com")
@@ -51,49 +56,97 @@ func init() {
 	}
 	RedisPool = newRedisPool()
 	MongoPool = newMongoPool()
+
+	// TODO: get watchlist from MongoDB
+	Watcher = &Watchers{WatchLists: make(map[string]*WatchList)}
 }
 
 func main() {
 	log.Info("Watcher started!")
 	c := RedisPool.Get()
 	defer c.Close()
-	queuedEvents := make(chan *QueuedEvent, 100)
-	wgDispatch := new(sync.WaitGroup)
-	wgDispatch.Add(2)
-	go watchQueue(c, queuedEvents)
-	go dispatchEvents(queuedEvents)
-	wgDispatch.Wait()
+	mux := registerRoutes()
+	http.Handle("/", mux)
+	http.ListenAndServe("localhost:8080", nil)
+
 }
 
-func watchQueue(c redis.Conn, ch chan *QueuedEvent) {
-	for {
-
-		redisEvents, err := redis.Strings(c.Do("BLPOP", RedisQueue, 0))
-		if err != nil {
-			log.Fatal("BLPOP error..", err)
-		}
-		queuedEvent := QueuedEvent{}
-		err = json.Unmarshal([]byte(redisEvents[1]), &queuedEvent)
-		if err != nil {
-			log.Errorf("WatchQueue > Skipping this record. Unable to unmarshal json: %s, %s", redisEvents[1], err)
-			continue
-		}
-		ch <- &queuedEvent
+func getWatchList(e *Event) *WatchList {
+	Watcher.Lock()
+	defer Watcher.Unlock()
+	if _, ok := Watcher.WatchLists[e.UserID]; !ok {
+		Watcher.WatchLists[e.UserID] = NewWatchList(e, MongoPool)
 	}
+	return Watcher.WatchLists[e.UserID]
 }
 
-func dispatchEvents(in chan *QueuedEvent) {
+func getWatchListFromUserID(userID string) *WatchList {
+	Watcher.Lock()
+	defer Watcher.Unlock()
+	if _, ok := Watcher.WatchLists[userID]; ok {
+		return Watcher.WatchLists[userID]
+	}
+	return nil
+}
 
-	users := make(map[string]*User)
-	for queuedEvent := range in {
-		log.Info("DispatchEvents > ReceivedEvents: ", queuedEvent)
-		if _, ok := users[queuedEvent.UserID]; !ok {
-			users[queuedEvent.UserID] = NewUser(queuedEvent, MongoPool)
-		}
-		// updating token just in case
-		users[queuedEvent.UserID].Token = queuedEvent.Token
-		// Sending event
-		users[queuedEvent.UserID].AddWatchedEvent(queuedEvent.EventID)
+func registerRoutes() *pat.PatternServeMux {
+	mux := pat.New()
+	mux.Post("/watchedEvents", http.HandlerFunc(AddEvent))
+	mux.Del("/watchedEvent/:resourceID", http.HandlerFunc(delEvent))
+	mux.Get("/watchedEvents/:resourceID", http.HandlerFunc(listEvents))
+	return mux
+}
+
+func AddEvent(w http.ResponseWriter, r *http.Request) {
+	event := &Event{}
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte(`{"status": "error","description":"unable to read body"}`))
+		return
+	}
+	err = json.Unmarshal(body, event)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte(`{"status": "error","description":"unable to decode json"}`))
+		return
+	}
+	getWatchList(event).Add(event.EventID)
+	w.Write([]byte(`{"status": "success"}\r\n`))
+}
+
+func listEvents(w http.ResponseWriter, r *http.Request) {
+	params := r.URL.Query()
+	userID := params.Get(":userID")
+	WatchList := getWatchListFromUserID(userID)
+	if WatchList == nil {
+		w.WriteHeader(404)
+		w.Write([]byte(`{"status": "error","description":"user not found"}`))
+		return
+	}
+	json, err := json.Marshal(WatchList.List())
+	if err != nil {
+		w.WriteHeader(500)
+		log.Error("listEvents > Unable to json: ", err)
+		return
+	}
+	w.Write(json)
+}
+
+func delEvent(w http.ResponseWriter, r *http.Request) {
+	params := r.URL.Query()
+	userID := params.Get(":id")
+	WatchList := getWatchListFromUserID(userID)
+	if WatchList == nil {
+		w.WriteHeader(404)
+		w.Write([]byte(`{"status": "error","description":"user not found"}`))
+		return
+	}
+	json, err := json.Marshal(WatchList.List())
+	if err != nil {
+		w.WriteHeader(500)
+		log.Error("listEvents > Unable to json: ", err)
+		return
 	}
 }
 
