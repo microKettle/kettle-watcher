@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -15,37 +16,36 @@ import (
 )
 
 var (
-	RedisAddr    = os.Getenv("REDIS_ADDR")
-	FrontDeskURL = os.Getenv("FRONTDESKURL")
-	MongoHost    = os.Getenv("MONGODB_HOST")
-	SlackWebHook = os.Getenv("SLACK_WEBHOOK")
-	MongoDB      = "kettle-watcher"
-	Watcher      *Watchers
-	RedisPool    *redis.Pool
-	MongoPool    *mgo.Session
+	KettleFrontDesk = os.Getenv("KETTLE_FRONTDESK")
+	MongoHost       = os.Getenv("MONGODB_HOST")
+	SlackWebHook    = os.Getenv("SLACK_WEBHOOK")
+	MongoDB         = "kettle-watcher"
+	Watcher         *Watchers
+	RedisPool       *redis.Pool
+	MongoPool       *mgo.Session
 )
 
 type Event struct {
-	UserID  string `json:userID`
-	EventID string `json:eventID`
-	Token   string `json:token`
+	UserID  int
+	EventID int `json:"eventId"`
+	Token   string
+}
+
+type Events struct {
+	Events []int `json:"events"`
 }
 
 type Watchers struct {
-	WatchLists map[string]*WatchList
+	Users map[int]*WatchList
 	sync.Mutex
 }
 
 func init() {
 
-	log.SetLevel(log.DebugLevel)
-	if len(RedisAddr) == 0 {
-		log.Info("Env REDIS_ADDR is not set. Fallback to localhost")
-		RedisAddr = "localhost"
-	}
-	if len(FrontDeskURL) == 0 {
-		log.Info("Env FRONTDESKURL is not set. Fallback to https://lutece.frontdeskhq.com")
-		FrontDeskURL = "https://lutece.frontdeskhq.com"
+	log.SetLevel(log.InfoLevel)
+	if len(KettleFrontDesk) == 0 {
+		log.Info("Env KETTLE_FRONTDESK is not set. Fallback to https://localhost")
+		KettleFrontDesk = "https://localhost"
 	}
 	if len(MongoHost) == 0 {
 		log.Info("Env MONGODB_HOST is not set. Fallback to localhost")
@@ -54,11 +54,10 @@ func init() {
 	if len(SlackWebHook) == 0 {
 		log.Warn("Env SLACK_WEBHOOK is not set. Notifications will fail.")
 	}
-	RedisPool = newRedisPool()
 	MongoPool = newMongoPool()
 
 	// TODO: get watchlist from MongoDB
-	Watcher = &Watchers{WatchLists: make(map[string]*WatchList)}
+	Watcher = &Watchers{Users: make(map[int]*WatchList)}
 }
 
 func main() {
@@ -74,96 +73,113 @@ func main() {
 func getWatchList(e *Event) *WatchList {
 	Watcher.Lock()
 	defer Watcher.Unlock()
-	if _, ok := Watcher.WatchLists[e.UserID]; !ok {
-		Watcher.WatchLists[e.UserID] = NewWatchList(e, MongoPool)
+	if _, ok := Watcher.Users[e.UserID]; !ok {
+		Watcher.Users[e.UserID] = NewWatchList(e, MongoPool)
 	}
-	return Watcher.WatchLists[e.UserID]
+	return Watcher.Users[e.UserID]
 }
 
-func getWatchListFromUserID(userID string) *WatchList {
+func getWatchListFromUserID(userID int) *WatchList {
 	Watcher.Lock()
 	defer Watcher.Unlock()
-	if _, ok := Watcher.WatchLists[userID]; ok {
-		return Watcher.WatchLists[userID]
+	if _, ok := Watcher.Users[userID]; ok {
+		return Watcher.Users[userID]
 	}
 	return nil
 }
 
 func registerRoutes() *pat.PatternServeMux {
 	mux := pat.New()
-	mux.Post("/watchedEvents", http.HandlerFunc(AddEvent))
-	mux.Del("/watchedEvent/:resourceID", http.HandlerFunc(delEvent))
-	mux.Get("/watchedEvents/:resourceID", http.HandlerFunc(listEvents))
+	mux.Post("/users/:userID/events", http.HandlerFunc(AddEvent))
+	mux.Get("/users/:userID/events", http.HandlerFunc(ListEvents))
+	mux.Del("/users/:userID/events/:eventID", http.HandlerFunc(DeleteEvent))
 	return mux
 }
 
 func AddEvent(w http.ResponseWriter, r *http.Request) {
-	event := &Event{}
+	params := r.URL.Query()
+	userID := params.Get(":userID")
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(500)
 		w.Write([]byte(`{"status": "error","description":"unable to read body"}`))
 		return
 	}
+	event := &Event{}
 	err = json.Unmarshal(body, event)
 	if err != nil {
 		w.WriteHeader(500)
 		w.Write([]byte(`{"status": "error","description":"unable to decode json"}`))
 		return
 	}
+	uid, err := strconv.Atoi(userID)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte(`{"status": "error", "description":"unable to cast userID to int"}`))
+	}
+	event.UserID = uid
 	getWatchList(event).Add(event.EventID)
-	w.Write([]byte(`{"status": "success"}\r\n`))
+	w.WriteHeader(201)
+	w.Write([]byte(`{"event":` + strconv.Itoa(event.EventID) + `}`))
 }
 
-func listEvents(w http.ResponseWriter, r *http.Request) {
+func ListEvents(w http.ResponseWriter, r *http.Request) {
 	params := r.URL.Query()
 	userID := params.Get(":userID")
-	WatchList := getWatchListFromUserID(userID)
-	if WatchList == nil {
+	uid, err := strconv.Atoi(userID)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte(`{"status": "error", "description":"unable to cast userID to int"}`))
+	}
+	watchList := getWatchListFromUserID(uid)
+	if watchList == nil {
 		w.WriteHeader(404)
 		w.Write([]byte(`{"status": "error","description":"user not found"}`))
 		return
 	}
-	json, err := json.Marshal(WatchList.List())
+
+	json, err := json.Marshal(&Events{Events: watchList.List()})
 	if err != nil {
 		w.WriteHeader(500)
 		log.Error("listEvents > Unable to json: ", err)
 		return
 	}
+
 	w.Write(json)
 }
 
-func delEvent(w http.ResponseWriter, r *http.Request) {
+func DeleteEvent(w http.ResponseWriter, r *http.Request) {
 	params := r.URL.Query()
-	userID := params.Get(":id")
-	WatchList := getWatchListFromUserID(userID)
-	if WatchList == nil {
+	userID := params.Get(":userID")
+	reqEventID := params.Get(":eventID")
+	uid, err := strconv.Atoi(userID)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte(`{"status": "error", "description":"unable to cast userID to int"}`))
+	}
+	eventID, err := strconv.Atoi(reqEventID)
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte(`{"error": "EventID is not an integer"}`))
+	}
+	watchList := getWatchListFromUserID(uid)
+	if watchList == nil {
 		w.WriteHeader(404)
 		w.Write([]byte(`{"status": "error","description":"user not found"}`))
 		return
 	}
-	json, err := json.Marshal(WatchList.List())
-	if err != nil {
-		w.WriteHeader(500)
-		log.Error("listEvents > Unable to json: ", err)
+	err = watchList.Delete(eventID)
+	if err != nil && err.Error() == "not found" {
+		w.WriteHeader(404)
+		w.Write([]byte(`{"status": "error","` + err.Error() + `"}`))
 		return
 	}
-}
-
-func newRedisPool() *redis.Pool {
-	return &redis.Pool{
-		MaxIdle:     400,
-		IdleTimeout: 10 * time.Second,
-		MaxActive:   0,
-		Wait:        true,
-		Dial: func() (redis.Conn, error) {
-			c, err := redis.Dial("tcp", RedisAddr+":6379")
-			if err != nil {
-				panic(err.Error())
-			}
-			return c, err
-		},
+	if err != nil {
+		w.WriteHeader(500)
+		w.Write([]byte(`{"status": "error","` + err.Error() + `"}`))
+		return
 	}
+	w.Write([]byte(`{"event":` + strconv.Itoa(eventID) + `}`))
 }
 
 func newMongoPool() *mgo.Session {

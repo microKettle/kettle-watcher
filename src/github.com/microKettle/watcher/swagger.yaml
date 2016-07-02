@@ -1,0 +1,46 @@
+
+swagger: '2.0'
+
+info:
+  version: "1"
+  title: kettle-watcher
+
+paths:
+  /v1/users/:user_id/events:
+    get:
+      description: |
+        Gets `events` objects.
+      responses:
+
+        200:
+          description: Successful response
+
+          schema:
+            title: ArrayOfEvents
+            type: array
+            items:
+              title: event
+              type: integer
+
+    post:
+      description: |
+        Add event to watchlist for the user
+      responses:
+        201:
+          description: Successful response
+          schema:
+            title: event
+            type: integer
+
+  /v1/users/:user_id/events/:id:
+
+    delete:
+      description: |
+        Delete event for the user
+      responses:
+
+        200:
+          description: Successful response
+          schema:
+            title: event
+            type: integer

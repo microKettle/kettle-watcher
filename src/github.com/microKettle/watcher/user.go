@@ -4,14 +4,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	log "github.com/Sirupsen/logrus"
 )
 
 type User struct {
-	ID        string
-	Token     string
-	WatchList *WatchList
+	UserID int
 }
 
 type SlackMessage struct {
@@ -21,9 +20,9 @@ type SlackMessage struct {
 	Icon_emoji string `json:"icon_emoji"`
 }
 
-func (u *User) slackNotification(eventID string) {
+func (u *User) slackNotification(eventID int) {
 	// TODO: Create microservice for notification
-	m := &SlackMessage{Channel: "#general", Text: eventID + " open!", Username: "Kettle", Icon_emoji: ":computer:"}
+	m := &SlackMessage{Channel: "#general", Text: strconv.Itoa(eventID) + " open!", Username: "Kettle", Icon_emoji: ":computer:"}
 	b, _ := json.Marshal(m)
 	v := url.Values{}
 	v.Set("payload", string(b))

@@ -21,12 +21,12 @@ type FrontDeskEnrollments struct {
 	} `json:"enrollment_eligibilities"`
 }
 
-func GetEventEnrollmentEligibility(u *User, eventID string) (*FrontDeskEnrollments, error) {
+func GetEventEnrollmentEligibility(u *User, event int) (*FrontDeskEnrollments, error) {
+	eventID := strconv.Itoa(event)
 	client := &http.Client{}
-	url := FrontDeskURL + "/api/v2/front/event_occurrences/" + eventID + "/enrollment_eligibilities"
+	url := KettleFrontDesk + "/users/" + strconv.Itoa(u.UserID) + "/events/" + eventID + "/availibity"
 	log.Debugf("Polling > url: %s", url)
 	req, err := http.NewRequest("GET", url, nil)
-	req.Header.Add("Authorization", " Bearer "+u.Token)
 	log.Debug("getEnrollmentEligibility > request: ", req)
 	resp, err := client.Do(req)
 	if err != nil {

@@ -1,0 +1,9 @@
+sut:
+  build: .
+  command: go test -v
+  environment:
+    - MONGODB_HOST=mongodb
+  links:
+    - mongodb
+mongodb:
+  image: mongo:3.3
